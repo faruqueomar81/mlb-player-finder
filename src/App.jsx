@@ -1,5 +1,5 @@
 
-// FILE: src/App.jsx
+
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Camera,
