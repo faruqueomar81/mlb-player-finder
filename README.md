@@ -1,5 +1,5 @@
 
-// FILE: README.md
+
 # MLB Player Finder
 
 Android-friendly React + Vite web app that you can host on GitHub Pages.
