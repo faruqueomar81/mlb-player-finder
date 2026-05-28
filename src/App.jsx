@@ -1,5 +1,3 @@
-
-
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Camera,
@@ -18,11 +16,12 @@ import {
   CheckCircle2,
 } from "lucide-react";
 
-
 const API_BASE = "https://statsapi.mlb.com/api/v1";
 const CURRENT_SEASON = new Date().getFullYear();
 const CACHE_TTL_MS = 1000 * 60 * 15;
 
+// 👇 your Cloudflare Worker URL
+const WORKER_URL = "https://mlb-player-finder-worker.faruqueomar81.workers.dev";
 
 function styles() {
   return `
@@ -108,7 +107,7 @@ function styles() {
       .top-row { grid-template-columns: 1.08fr .92fr; }
       .hero { grid-template-columns: .9fr 1.1fr; align-items: start; }
       .camera-frame { aspect-ratio: 16 / 10; }
-      .button-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .button-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
       .profile-hero { grid-template-columns: 1fr auto; align-items: start; }
       .small-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .metric-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -232,7 +231,8 @@ function getPlayerSummary(person) {
   if (!person) return null;
 
   const team = person.currentTeam?.name || "No current team";
-  const position = person.primaryPosition?.abbreviation || person.primaryPosition?.name || "Position N/A";
+  const position =
+    person.primaryPosition?.abbreviation || person.primaryPosition?.name || "Position N/A";
   const bats = person.batSide?.description || "Unknown";
   const throwsHand = person.pitchHand?.description || "Unknown";
 
@@ -245,7 +245,10 @@ function getPlayerSummary(person) {
     number: person.primaryNumber || "—",
     height: person.height || "—",
     weight: person.weight || "—",
-    birthPlace: [person.birthCity, person.birthStateProvince || person.birthCountry].filter(Boolean).join(", ") || "—",
+    birthPlace:
+      [person.birthCity, person.birthStateProvince || person.birthCountry]
+        .filter(Boolean)
+        .join(", ") || "—",
     debut: person.mlbDebutDate || "—",
     active: person.active,
   };
@@ -258,7 +261,6 @@ export default function App() {
   const fileInputRef = useRef(null);
   const searchTimerRef = useRef(null);
 
-
   const [cameraOn, setCameraOn] = useState(false);
   const [capturedImage, setCapturedImage] = useState(null);
   const [query, setQuery] = useState("");
@@ -270,10 +272,10 @@ export default function App() {
   const [pitchingStats, setPitchingStats] = useState(null);
   const [statsMode, setStatsMode] = useState("hitting");
   const [loadingPlayer, setLoadingPlayer] = useState(false);
+  const [recognizing, setRecognizing] = useState(false);
   const [status, setStatus] = useState("Ready — capture a photo or search for an MLB player.");
   const [error, setError] = useState("");
   const [searchError, setSearchError] = useState("");
-
 
   useEffect(() => {
     return () => {
@@ -332,7 +334,7 @@ export default function App() {
         await videoRef.current.play();
       }
       setCameraOn(true);
-      setStatus("Camera ready — capture a frame, then confirm the player using search results.");
+      setStatus("Camera ready — capture a frame, then identify or search manually.");
     } catch (e) {
       setCameraOn(false);
       setError("Camera access failed. Open the app over HTTPS on your phone and allow camera permission.");
@@ -358,7 +360,8 @@ export default function App() {
     const ctx = canvas.getContext("2d");
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     setCapturedImage(canvas.toDataURL("image/jpeg", 0.92));
-    setStatus("Photo captured — now search or choose the correct player to pull live public stats.");
+    setStatus("Photo captured ✅ — tap Identify Player or search manually below.");
+    setError("");
   };
 
   const handleUpload = (event) => {
@@ -368,7 +371,8 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = () => {
       setCapturedImage(reader.result);
-      setStatus("Image uploaded — now search or choose the correct player to pull live public stats.");
+      setStatus("Image uploaded ✅ — tap Identify Player or search manually below.");
+      setError("");
     };
     reader.readAsDataURL(file);
   };
@@ -383,6 +387,8 @@ export default function App() {
     setStatus("Ready — capture a photo or search for an MLB player.");
     setError("");
     setSearchError("");
+    setQuery("");
+    setResults([]);
   };
 
   const loadPlayer = async (personId) => {
@@ -429,6 +435,67 @@ export default function App() {
     }
   };
 
+  const identifyPlayerFromImage = async () => {
+    if (!capturedImage) {
+      setError("Capture or upload an image first.");
+      return;
+    }
+
+    try {
+      setRecognizing(true);
+      setError("");
+      setStatus("Sending image to recognition service...");
+
+      const blob = await fetch(capturedImage).then((r) => r.blob());
+      const formData = new FormData();
+      formData.append("image", blob, "player.jpg");
+
+      const response = await fetch(WORKER_URL, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Recognition request failed.");
+      }
+
+      const result = await response.json();
+      const bestCandidate = result?.candidates?.[0];
+
+      if (!bestCandidate?.name) {
+        setStatus("No confident player match found. Please search manually.");
+        return;
+      }
+
+      setQuery(bestCandidate.name);
+      setStatus(`Best match found: ${bestCandidate.name}. Searching MLB data...`);
+
+      const searchData = await mlbFetch(
+        `/people/search?names=${encodeURIComponent(bestCandidate.name)}&sportId=1`,
+        {
+          cacheKey: `player-search:${bestCandidate.name.toLowerCase()}`,
+          ttl: 1000 * 60 * 30,
+        }
+      );
+
+      const people = searchData?.people || [];
+      if (!people.length) {
+        setStatus(`Match found (${bestCandidate.name}), but MLB search returned no results.`);
+        return;
+      }
+
+      await loadPlayer(people[0].id);
+      setStatus(`Player identified: ${bestCandidate.name}`);
+    } catch (err) {
+      console.error(err);
+      setError("Image recognition failed. You can still search manually below.");
+      setStatus("Recognition failed");
+    } finally {
+      setRecognizing(false);
+    }
+  };
+
   const summary = useMemo(() => getPlayerSummary(playerProfile), [playerProfile]);
 
   const visibleMetricCards = useMemo(() => {
@@ -450,11 +517,19 @@ export default function App() {
           <div className="top-row">
             <section className="card">
               <div className="card-header">
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: 12,
+                    alignItems: "flex-start",
+                    flexWrap: "wrap",
+                  }}
+                >
                   <div>
                     <h1 className="card-title">MLB Player Finder</h1>
                     <p className="card-subtitle">
-                      Static GitHub-hostable web app for Android. Use your phone camera to capture a player, then confirm the player and pull live public MLB profile + season metrics.
+                      Static GitHub-hostable web app for Android. Capture a player, identify through Cloudflare Worker + OpenAI, then load live MLB profile and season metrics.
                     </p>
                   </div>
                   <span className="tag">
@@ -476,7 +551,13 @@ export default function App() {
                       <Camera size={42} />
                       <div>
                         <div style={{ fontWeight: 800, fontSize: "1.1rem" }}>Start the rear camera</div>
-                        <div style={{ marginTop: 8, color: "rgba(255,255,255,.78)", lineHeight: 1.5 }}>
+                        <div
+                          style={{
+                            marginTop: 8,
+                            color: "rgba(255,255,255,.78)",
+                            lineHeight: 1.5,
+                          }}
+                        >
                           Host this app over HTTPS (for example with GitHub Pages) so Android browsers can grant camera access.
                         </div>
                       </div>
@@ -484,9 +565,7 @@ export default function App() {
                   )}
                 </div>
 
-
                 <canvas ref={canvasRef} style={{ display: "none" }} />
-
 
                 <div className="button-grid">
                   {!cameraOn ? (
@@ -499,25 +578,31 @@ export default function App() {
                     </button>
                   )}
 
-
                   <button className="btn btn-secondary" onClick={captureFrame} disabled={!cameraOn}>
                     <Camera size={16} /> Capture
                   </button>
 
+                  <button className="btn btn-primary" onClick={identifyPlayerFromImage} disabled={!capturedImage || recognizing}>
+                    {recognizing ? <Loader2 size={16} style={{ animation: "spin 1s linear infinite" }} /> : <Search size={16} />}
+                    {recognizing ? "Identifying..." : "Identify Player"}
+                  </button>
 
                   <button className="btn btn-secondary" onClick={() => fileInputRef.current?.click()}>
                     <Upload size={16} /> Upload
                   </button>
-
 
                   <button className="btn btn-outline" onClick={clearSession}>
                     <RefreshCcw size={16} /> Reset
                   </button>
                 </div>
 
-
-                <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleUpload} />
-
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  style={{ display: "none" }}
+                  onChange={handleUpload}
+                />
 
                 <div className="status-box" style={{ marginTop: 14 }}>
                   <div className="status-row">
@@ -525,7 +610,7 @@ export default function App() {
                       <div className="status-label">Status</div>
                       <div className="status-value">{status}</div>
                     </div>
-                    {(searching || loadingPlayer) && (
+                    {(searching || loadingPlayer || recognizing) && (
                       <div className="progress">
                         <div className="progress-bar" />
                       </div>
@@ -536,10 +621,9 @@ export default function App() {
               </div>
             </section>
 
-
             <section className="card">
               <div className="card-header">
-                <h2 className="card-title">How this GitHub version works</h2>
+                <h2 className="card-title">How this version works</h2>
               </div>
               <div className="card-body small-grid">
                 <div className="notice">
@@ -549,6 +633,7 @@ export default function App() {
                   <ul className="helper-list" style={{ marginTop: 10 }}>
                     <li>Rear camera capture on Android</li>
                     <li>Image upload fallback</li>
+                    <li>Cloudflare Worker image recognition</li>
                     <li>Live player search from public MLB data</li>
                     <li>Real player profile + season stats</li>
                     <li>Pure front-end hosting on GitHub Pages</li>
@@ -557,27 +642,26 @@ export default function App() {
 
                 <div className="notice">
                   <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700 }}>
-                    <AlertCircle size={16} color="#b45309" /> What needs a backend later
+                    <AlertCircle size={16} color="#b45309" /> Recognition notes
                   </div>
                   <ul className="helper-list" style={{ marginTop: 10 }}>
-                    <li>Automatic image recognition of arbitrary MLB players</li>
-                    <li>Confidence scoring from a real vision model</li>
-                    <li>Private or licensed training-image workflows</li>
+                    <li>Recognition depends on image quality and player visibility</li>
+                    <li>Low-confidence or partial images may still require manual search</li>
+                    <li>Manual MLB player search remains available as a fallback</li>
                   </ul>
                 </div>
 
                 <div className="notice" style={{ gridColumn: "1 / -1" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700 }}>
-                    <Shield size={16} color="#475569" /> Static-hosting flow
+                    <Shield size={16} color="#475569" /> Secure flow
                   </div>
                   <p className="footer-note" style={{ margin: "10px 0 0" }}>
-                    Capture or upload a photo, then search the player name and tap the correct result. The app then pulls live public data directly from MLB in the browser.
+                    Your GitHub Pages app captures the image, sends it to a Cloudflare Worker, the Worker uses the server-side secret to call OpenAI, and the browser only receives the candidate player result.
                   </p>
                 </div>
               </div>
             </section>
           </div>
-
 
           <div className="hero">
             <section className="card">
@@ -596,9 +680,7 @@ export default function App() {
                   />
                 </div>
 
-
                 {searchError && <div className="error">{searchError}</div>}
-
 
                 <div className="result-list">
                   {searching ? (
@@ -609,7 +691,8 @@ export default function App() {
                   ) : results.length ? (
                     results.map((player) => {
                       const teamName = player.currentTeam?.name || "No current team";
-                      const position = player.primaryPosition?.abbreviation || player.primaryPosition?.name || "N/A";
+                      const position =
+                        player.primaryPosition?.abbreviation || player.primaryPosition?.name || "N/A";
                       return (
                         <button
                           key={player.id}
@@ -619,7 +702,9 @@ export default function App() {
                           <div className="result-top">
                             <div>
                               <div className="result-name">{player.fullName}</div>
-                              <div className="result-meta">{teamName} • {position}</div>
+                              <div className="result-meta">
+                                {teamName} • {position}
+                              </div>
                             </div>
                             <span className={`badge ${player.active ? "badge-green" : "badge-blue"}`}>
                               {player.active ? "Active" : "Player"}
@@ -633,13 +718,12 @@ export default function App() {
                     })
                   ) : (
                     <div className="empty">
-                      Start with a player search, then tap a result to load the profile and stats.
+                      Start with a player search, or capture a photo and tap <strong>Identify Player</strong>.
                     </div>
                   )}
                 </div>
               </div>
             </section>
-
 
             <section className="card">
               <div className="card-header">
@@ -658,12 +742,21 @@ export default function App() {
                     <div className="profile-hero">
                       <div className="profile-head">
                         <div>
-                          <div style={{ display: "flex", alignItems: "center", gap: 8, color: "rgba(255,255,255,.82)", fontSize: ".92rem" }}>
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
+                              color: "rgba(255,255,255,.82)",
+                              fontSize: ".92rem",
+                            }}
+                          >
                             <User size={16} /> Selected player
                           </div>
                           <div className="profile-name">{playerProfile.fullName}</div>
                           <div className="profile-meta">
-                            {summary.team} • {summary.position}<br />
+                            {summary.team} • {summary.position}
+                            <br />
                             #{summary.number} • Age {summary.age} • Bats {summary.bats} • Throws {summary.throwsHand}
                           </div>
                         </div>
@@ -678,17 +771,20 @@ export default function App() {
                       <div className="summary-box">
                         <div className="field-label">Bio</div>
                         <div className="footer-note">
-                          Height {summary.height} • Weight {summary.weight}<br />
-                          Birthplace {summary.birthPlace}<br />
-                          MLB debut {summary.debut}<br />
+                          Height {summary.height} • Weight {summary.weight}
+                          <br />
+                          Birthplace {summary.birthPlace}
+                          <br />
+                          MLB debut {summary.debut}
+                          <br />
                           Status {summary.active ? "Active" : "Inactive"}
                         </div>
                       </div>
 
                       <div className="summary-box">
-                        <div className="field-label">Usage note</div>
+                        <div className="field-label">Recognition source</div>
                         <div className="footer-note">
-                          This version is intentionally static-host friendly. Automatic player recognition can be layered on later by posting the captured image to a backend vision service.
+                          If the identified player is not correct, use the manual search panel to override the result and load a different player card.
                         </div>
                       </div>
                     </div>
@@ -720,14 +816,16 @@ export default function App() {
                         {visibleMetricCards.length ? (
                           <MetricGrid items={visibleMetricCards} />
                         ) : (
-                          <div className="empty">No {statsMode} data is available for this player for the {CURRENT_SEASON} season.</div>
+                          <div className="empty">
+                            No {statsMode} data is available for this player for the {CURRENT_SEASON} season.
+                          </div>
                         )}
                       </div>
                     </div>
                   </div>
                 ) : (
                   <div className="empty">
-                    Capture a photo if you want, then search for a player and tap a result to load the live MLB profile and stats.
+                    Capture or upload a photo, tap <strong>Identify Player</strong>, or search manually to load the live MLB profile and stats.
                   </div>
                 )}
               </div>
@@ -736,18 +834,18 @@ export default function App() {
 
           <section className="card">
             <div className="card-header">
-              <h2 className="card-title">Next step if you want true camera recognition</h2>
+              <h2 className="card-title">Production notes</h2>
             </div>
             <div className="card-body">
               <div className="notice">
                 <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700 }}>
-                  <Trophy size={16} color="#1d4ed8" /> Recommended production upgrade
+                  <Trophy size={16} color="#1d4ed8" /> Current architecture
                 </div>
                 <ul className="helper-list" style={{ marginTop: 10 }}>
-                  <li>Keep this exact front end on GitHub Pages.</li>
-                  <li>Add a small backend API (Azure Functions, FastAPI, or similar) that accepts the captured image.</li>
-                  <li>Run a vision model on the backend to return likely player matches.</li>
-                  <li>Use this front end to display the best match and then pull the live MLB metrics.</li>
+                  <li>GitHub Pages hosts the React UI</li>
+                  <li>Cloudflare Worker securely stores the OpenAI API key</li>
+                  <li>Worker returns player candidates to the browser</li>
+                  <li>Browser uses MLB public APIs to load player details and season stats</li>
                 </ul>
               </div>
             </div>
