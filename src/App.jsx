@@ -562,6 +562,10 @@ export default function App() {
                   >
                     <div>
                       <h1 className="card-title">MLB Player Finder</h1>
+                      
+                      <div style={{ marginTop: 6, fontSize: ".92rem", color: "#64748b", fontWeight: 600 }}>
+                          Developed by Faruque
+                      </div>
                       <p className="card-subtitle">
                         Capture a player photo, identify through Cloudflare Worker + AI, then load live MLB profile and season metrics.
                       </p>
